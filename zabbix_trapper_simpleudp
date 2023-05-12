@@ -1,0 +1,157 @@
+#! /usr/bin/perl -w
+
+# by Pedro Zorzenon Neto, february 2023
+# simple UDP protocol to receive telemetry and resend to Zabbix
+
+use IO::Socket;
+
+$zabbix_tcp_addr = '127.0.0.1';
+$zabbix_tcp_port = 10051;
+$udp_recv_port = 10051;
+
+$debug = 0;
+if (defined $ARGV[0]) {
+    $debug = int($ARGV[0]);
+}
+
+# designed to use VPN or internal network, where auth/crypto is not needed
+$accept_pkg_without_auth = 1;
+
+$| = 1;
+
+print time()." begin RX:UDP $udp_recv_port => TX:TCP $zabbix_tcp_addr:$zabbix_tcp_port DBG=$debug\n";
+
+$server = IO::Socket::INET->new(LocalPort => $udp_recv_port,
+                                Proto     => "udp")
+    or die "Couldn't open UDP socket: $@\n";
+
+sub auth_check {
+    my ($token) = shift;
+    return 1; # TODO - implement auth if needs to work at insecure network someday
+}
+
+sub alarm_tick {
+}
+sub sighandler {
+    $stop = 1;
+}
+
+sub zabbix_send {
+    my ($d) = shift;
+    alarm 10;
+    my $z = IO::Socket::INET->new(PeerAddr => $zabbix_tcp_addr,
+				  PeerPort => $zabbix_tcp_port,
+				  Proto    => "tcp",
+				  Type     => SOCK_STREAM);
+    if ($z) {
+	my $pkg = "ZBXD\1".pack("(LL)<",length($d),0).$d;
+	print $z $pkg;
+	close $z;
+    } else {
+    	print "$now ERR: couldn't connect to Zabbix via TCP: $@\n";
+    }
+}
+
+$SIG{ALRM} = 'alarm_tick';
+$SIG{TERM} = 'sighandler';
+$SIG{INT} = 'sighandler';
+$SIG{QUIT} = 'sighandler';
+
+while (not defined $stop) {
+    alarm 5;
+    $peer = $server->recv($datagram, 1024);
+    $now = time();
+    # print "$now tick\n";
+    if (defined $peer) {
+	# print "recv ".length($datagram)."\n";
+	@lines = split(/\n/,$datagram);
+	# print $lines[0]."\n";
+	undef $ts;
+	undef $hname;
+	if ($#lines >= 0) {
+	    if ($debug) {
+		print "$now UDP:RX\n";
+		for ($i=0; $i<=$#lines; $i++) {
+		    print "> $lines[$i]\n";
+		}
+	    }
+	    $hdr = $lines[0];
+	    if (($accept_pkg_without_auth) &&
+		($hdr =~ m/^[0-9]{10,15},[A-Za-z0-9_:-]{1,20}$/)) {
+		($ts,$pkgid) = split(/,/,$hdr,2);
+	    }
+	    if ($hdr =~ m/^[0-9]{10,15},[A-Za-z0-9_:-]{1,20},[a-zA-Z0-9:]{8,64}$/) {
+		($ts,$pkgid,$auth) = split(/,/,$hdr,3);
+		if (! auth_check($auth)) {
+		    print "ERR: auth failed\n" if $debug;
+		    undef $ts;
+		}
+	    }
+	}
+	if ($debug && (not defined $ts)) {
+	    print "ERR: unknown header\n";
+	}
+	if (defined $ts) {
+	    if (not defined $ack{"$ts,$pkgid"}) {
+		if (($ts > ($now-86400)) &&
+		    ($ts < ($now+300))) {
+		    # process only packages newer than 1 day
+		    # and at most 5 minutes in the future
+		    for ($i=1; $i<=$#lines; $i++) {
+			($h,$k,$v) = split(/,/,$lines[$i],3);
+			if ((defined $h) && (defined $k) && (defined $v)) {
+			    if (($k ne '') && ($v ne '')) {
+				$hname = $h if $h ne '';
+				if (defined $hname) {
+				    $buf_ts = $now+5 if $#buf < 0;
+				    $buf[$#buf+1] = "$ts,$hname,$k,$v";
+				    print "GOT: $ts,$hname,$k,$v\n" if $debug;
+				}
+			    }
+			}
+		    }
+		} else {
+		    print "ERR: $ts out-a-time\n" if $debug;
+		}
+	    } else {
+		print "WARN: pkg duplicated\n" if $debug;
+	    }
+	    $ack{"$ts,$pkgid"} = $now unless $pkgid eq "0";
+	    # print "reply $ts,$pkgid\n";
+	    $server->send("$ts,$pkgid");
+	}
+    }
+
+    if ($#buf >= 0) {
+	if (($now >= $buf_ts) ||
+	    ($#buf > 1000)) {
+	    # send data
+	    $zab = '{"request":"sender data","data":[';
+	    print "$now TCP:TX\n" if $debug;
+	    for ($i=0; $i<=$#buf; $i++) {
+		@v = split(/,/,$buf[$i],4);
+		$zab .= ',' if $i > 0;
+		$v[1] =~ s/"//g;
+		$v[2] =~ s/"//g;
+		$v[3] =~ s/"/\\"/g;
+		$zab .= '{"host":"'.$v[1].'","key":"'.$v[2].
+		    '","value":"'.$v[3].'","clock":'.$v[0].',"ns":0}';
+		print "> t=$v[0] s=\"$v[1]\" k=\"$v[2]\" v=\"$v[3]\"\n" if $debug;
+	    }
+	    $zab .= ']}';
+	    zabbix_send($zab);
+	    undef @buf;
+	    # clear old values in ACK queue (older than 2 minutes)
+	    foreach $k (keys %ack) {
+		delete $ack{$k} unless $ack{$k} > ($now-120);
+	    }
+	}
+    }
+
+    if (-e "/tmp/zabbix_trapper_simpleudp.restart") {
+	print time()." restart file detected\n";
+	unlink "/tmp/zabbix_trapper_simpleudp.restart";
+	$stop = 1;
+    }
+}
+print time()." finished\n";

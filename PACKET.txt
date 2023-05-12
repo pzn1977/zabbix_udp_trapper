@@ -1,0 +1,63 @@
+* This file describes packet format and how to use it *
+
+Packets are simple text-plain with the following format:
+
+  unixtimestamp,randomstring
+  hostname,key1,value1
+  hostname,key2,value2
+  hostname,key3,value3
+  hostname,key...,value...
+
+randomstring: 1~20 chars, allowed chars: uppercase, lowercase,
+numbers, underscore, hyphen, colon
+
+Answer (ACK) packets are replied to with the first line.
+
+  unixtimestamp,randomstring
+
+The UDP receiver can identify duplicated packets (by comparing the
+first line) and forward just the first one to Zabbix Trapper. ACK
+packet is generated for each received packet.
+
+Limit: UDP packet must be < 1024 bytes.
+
+
+* Caveats *
+
+ - you can omit the hostname. It will be copied from the previous
+   lines:
+ 
+  unixtimestamp,randomstring
+  hostname,key1,value1
+  ,key2,value2
+  ,key3,value3
+  ,key...,value...
+
+ - if you need to send a packet with data from more than one device,
+   you can do this way:
+   
+  unixtimestamp,randomstring
+  hostname1,key1,value1
+  ,key2,value2
+  hostname2,key1,value1
+  ,key2,value2
+  ...
+
+
+* Simple packet sending example *
+
+Using bash + netcat, to test things:
+
+  SERVERIP=10.20.30.4
+  TS=$(date +%s)
+  R=thing:$RANDOM
+  HNAME=myhost
+  K1=uptime
+  V1=123
+  K2=freememory
+  V2=4567
+  K3=otherthing
+  V3=weird.value
+  echo -e -n "$TS,$R\n$HNAME,$K1,$V1\n,$K2,$V2\n,$K3,$V3\n" | netcat -u $SERVERIP 10051
+
+The server will ACK the packet. ACK packet contents is: $TS,$R\n
